@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "properties": {
+    "location": {
+      "type": "string",
+      "description": "The beach or location name for surf prediction"
+    },
+    "date": {
+      "type": "string",
+      "description": "The date for the prediction in ISO format (YYYY-MM-DD)",
+      "format": "date"
+    }
+  },
+  "required": ["location"],
+  "additionalProperties": false
+} 
