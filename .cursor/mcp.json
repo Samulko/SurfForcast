@@ -1,9 +1,9 @@
 {
   "mcpServers": {
     "windy-surf-forecast": { 
-      "command": "python",     
+      "command": "C:\\Python313\\python.exe",     
       "args": [
-         "${workspaceFolder}/mcp_surf_server/windy_server.py"
+         "mcp_surf_server/windy_server.py"
         ],
       "env": {
         "WINDY_API_KEY": "OhAmpXCOh2JXBSB6tRF5U4WhrXjYlXX1" 
