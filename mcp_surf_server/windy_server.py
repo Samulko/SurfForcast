@@ -8,6 +8,8 @@ try:
     import asyncio # For concurrent API calls
     import json # For formatting the output
     import traceback # For better error logging
+    import math # For wind calculations
+    from datetime import datetime, timezone # For timestamp formatting
     from typing import Optional, List, Dict # For type hinting
     from pydantic import BaseModel, Field, ValidationError # For data validation
     from mcp.server.fastmcp import FastMCP, Context
@@ -24,11 +26,37 @@ try:
     WINDY_API_URL = "https://api.windy.com/api/point-forecast/v2"
     # --- Configuration loaded --- # Removed comment
 
+    # --- Helper Functions ---
+    def calculate_wind_speed(u: float, v: float) -> float:
+        """Calculates wind speed from u and v components."""
+        return math.sqrt(u**2 + v**2)
+
+    def calculate_wind_direction(u: float, v: float) -> str:
+        """Calculates cardinal/ordinal wind direction from u and v components."""
+        angle_rad = math.atan2(u, v) # Meteorological convention (0 deg = North wind)
+        angle_deg = math.degrees(angle_rad)
+        wind_dir_corrected = (angle_deg + 360) % 360
+
+        directions = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+        index = round(wind_dir_corrected / 22.5) % 16
+        return directions[index]
+
+    def format_timestamp_iso(timestamp_ms: int) -> str:
+        """Formats a millisecond timestamp into an ISO 8601 string (UTC)."""
+        try:
+            dt_object = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+            # Format to ISO 8601, ensuring 'Z' for UTC
+            return dt_object.isoformat(timespec='seconds').replace('+00:00', 'Z')
+        except (ValueError, TypeError):
+            # Handle potential issues with the timestamp value
+            return "Invalid Timestamp"
+
     # --- Pydantic Models ---
     class TimePointData(BaseModel):
         # Define the structure for a single forecast time point
         # Use Field(alias=...) to handle keys with hyphens
         timestamp: int
+        timestamp_iso: Optional[str] = None # Added: ISO 8601 formatted timestamp (UTC)
         waves_height_surface: Optional[float] = Field(None, alias="waves_height-surface")
         waves_period_surface: Optional[float] = Field(None, alias="waves_period-surface")
         waves_direction_surface: Optional[float] = Field(None, alias="waves_direction-surface")
@@ -38,9 +66,17 @@ try:
         swell1_height_surface: Optional[float] = Field(None, alias="swell1_height-surface")
         swell1_period_surface: Optional[float] = Field(None, alias="swell1_period-surface")
         swell1_direction_surface: Optional[float] = Field(None, alias="swell1_direction-surface")
+        swell2_height_surface: Optional[float] = Field(None, alias="swell2_height-surface")
+        swell2_period_surface: Optional[float] = Field(None, alias="swell2_period-surface")
+        swell2_direction_surface: Optional[float] = Field(None, alias="swell2_direction-surface")
         wind_u_surface: Optional[float] = Field(None, alias="wind_u-surface")
         wind_v_surface: Optional[float] = Field(None, alias="wind_v-surface")
+        wind_speed_surface: Optional[float] = None # Added: Derived wind speed (m/s)
+        wind_direction_cardinal: Optional[str] = None # Added: Derived wind direction (e.g., N, SW)
         gust_surface: Optional[float] = Field(None, alias="gust-surface")
+        temp_surface: Optional[float] = Field(None, alias="temp-surface")
+        precip_surface: Optional[float] = Field(None, alias="past3hprecip-surface")
+        ptype_surface: Optional[int] = Field(None, alias="ptype-surface")
 
         class Config:
             populate_by_name = True # Allows using both alias and field name
@@ -94,8 +130,12 @@ try:
     @mcp.tool() # Decorator to define an MCP tool
     async def get_surfing_conditions(latitude: float, longitude: float, ctx: Context) -> str:
         """
-        Fetches surfing conditions (waves, wind) for a given latitude and longitude using the Windy API.
-        Requires two separate API calls for wave (gfsWave) and wind (gfs) data.
+        Fetches surfing conditions (waves, swells, wind, temp, precip) for a given latitude and longitude.
+        Uses the Windy API with gfsWave (waves) and gfs (wind/weather) models.
+        Returns a JSON object with 'units' and a 'forecast' list.
+        Each item in 'forecast' represents a time point (typically 3-hour intervals) 
+        containing various parameters and a 'timestamp' (UTC milliseconds since epoch).
+        The client should handle timezone conversion for local display.
         Provide latitude and longitude coordinates.
         """
         # --- Tool get_surfing_conditions called ---
@@ -106,9 +146,9 @@ try:
         await ctx.info(f"Fetching forecast for Lat: {latitude}, Lon: {longitude}") # Log progress
 
         # Define parameters for each model
-        wave_parameters = ["waves", "windWaves", "swell1"]
+        wave_parameters = ["waves", "windWaves", "swell1", "swell2"]
         wave_model = "gfsWave"
-        wind_parameters = ["wind", "windGust"]
+        wind_parameters = ["wind", "windGust", "temp", "precip", "ptype"]
         wind_model = "gfs"
 
         combined_data = {}
@@ -162,7 +202,11 @@ try:
             if ts_list:
                 await ctx.info(f"Processing data for {len(ts_list)} timestamps.")
                 for i, timestamp in enumerate(ts_list):
-                    time_point_data = {"timestamp": timestamp}
+                    # Initialize with original timestamp and derived ISO format
+                    time_point_data = {
+                        "timestamp": timestamp,
+                        "timestamp_iso": format_timestamp_iso(timestamp)
+                    }
 
                     # Add wave data for this timestamp
                     if has_wave_data:
@@ -196,20 +240,25 @@ try:
                                     wind_data_index = -1 # Indicate not found
 
                             if wind_data_index != -1:
+                                u_comp, v_comp = None, None # Store components for derived values
                                 for param in wind_parameters:
                                     if param == "wind":
                                         for comp in ['u', 'v']:
                                             key = f"wind_{comp}-surface"
                                             if key in wind_results and wind_data_index < len(wind_results[key]):
-                                                time_point_data[key] = wind_results[key][wind_data_index]
+                                                value = wind_results[key][wind_data_index]
+                                                time_point_data[key] = value
+                                                if comp == 'u': u_comp = value
+                                                if comp == 'v': v_comp = value
                                             elif key in wind_results:
                                                 await ctx.warning(f"Missing data for {key} at index {wind_data_index}")
-                                    else:
-                                        key = f"{param}-surface"
-                                        if key in wind_results and wind_data_index < len(wind_results[key]):
-                                            time_point_data[key] = wind_results[key][wind_data_index]
-                                        elif key in wind_results:
-                                            await ctx.warning(f"Missing data for {key} at index {wind_data_index}")
+
+                                # Calculate and add derived wind data if components exist
+                                if u_comp is not None and v_comp is not None:
+                                    time_point_data["wind_speed_surface"] = calculate_wind_speed(u_comp, v_comp)
+                                    time_point_data["wind_direction_cardinal"] = calculate_wind_direction(u_comp, v_comp)
+                                else:
+                                    await ctx.warning(f"Missing wind u/v components at index {wind_data_index}, cannot calculate derived wind info.")
                          else:
                             await ctx.warning(f"Wind timestamp array missing or too short at index {i}")
 
@@ -229,18 +278,16 @@ try:
                 validated_response = WindyForecastResponse(units=all_units, forecast=forecast_data)
                 # Convert the Pydantic model back to a dict for JSON serialization
                 # Use by_alias=True to ensure hyphens are used in the output keys
-                final_result_dict = validated_response.model_dump(by_alias=True)
+                final_result_dict = validated_response.model_dump(by_alias=True, exclude_none=True) # Exclude None values for cleaner output
                 await ctx.info("Successfully processed and validated forecast data.")
 
+                # Log warnings separately if they exist
                 if error_messages:
-                    warning_prefix = "Warning: Could not retrieve or process all data:\n" + "\n".join(error_messages) + "\n\nPartial Forecast:\n"
-                    await ctx.warning(warning_prefix)
-                    # Return validated but partial data
-                    return warning_prefix + json.dumps(final_result_dict, indent=2)
-                else:
-                     await ctx.info("Successfully fetched, combined, and validated forecast data.")
-                     # Return validated, complete data
-                     return f"Forecast received from Windy:\n{json.dumps(final_result_dict, indent=2)}"
+                    warning_message = "Warnings during data retrieval/processing:\n" + "\n".join(error_messages)
+                    await ctx.warning(warning_message)
+
+                # Return the structured, validated data as JSON
+                return json.dumps(final_result_dict, indent=2)
 
             except ValidationError as e:
                 error_summary = "\n".join(error_messages) if error_messages else ""
@@ -249,8 +296,11 @@ try:
                 return validation_error_msg
             except Exception as e:
                 # Catch any other unexpected errors during validation/serialization
-                error_summary = "\n".join(error_messages) if error_messages else ""
-                unexpected_error_msg = f"Error: An unexpected error occurred during final processing.\nDetails: {str(e)}\n{error_summary}"
+                # Log warnings if they exist
+                if error_messages:
+                    warning_message = "Warnings prior to unexpected error:\n" + "\n".join(error_messages)
+                    await ctx.warning(warning_message)
+                unexpected_error_msg = f"Error: An unexpected error occurred during final processing.\nDetails: {str(e)}"
                 await ctx.error(unexpected_error_msg)
                 return unexpected_error_msg
 
