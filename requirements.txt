@@ -1,0 +1,11 @@
+# MCP Framework and CLI tools
+mcp[cli]>=1.2.0 # Includes FastMCP [cite: 13, 297]
+
+# HTTP client library
+httpx # For making API calls to Windy [cite: 6, 16]
+
+# Environment variable loading
+python-dotenv # For loading .env file
+
+# Data validation and parsing
+pydantic # For structuring and validating API response data
